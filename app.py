@@ -112,7 +112,12 @@ def read_df(query, params=None):
         cur.execute(query, params or [])
         rows = cur.fetchall()
         columns = [desc[0] for desc in cur.description] if cur.description else []
-    return pd.DataFrame(rows, columns=columns)
+    df = pd.DataFrame(rows, columns=columns)
+
+    if "tutar" in df.columns:
+        df["tutar"] = pd.to_numeric(df["tutar"], errors="coerce").fillna(0.0)
+
+    return df
 
 def execute_query(query, params=None):
     conn = get_conn()
@@ -320,49 +325,59 @@ def hesap_ozet(df):
             "bekleyen_tahsilat": 0.0,
         }
 
-    gelir = df[df["islem_turu"] == "Gelir"]["tutar"].sum()
-    gider = df[df["islem_turu"] == "Gider"]["tutar"].sum()
-    ciro = gelir
-    brut_kar = gelir - gider
+    df = df.copy()
+
+    # Sayısal alanları güvenli şekilde float'a çevir
+    df["tutar"] = pd.to_numeric(df["tutar"], errors="coerce").fillna(0.0)
+
+    if "odeme_durumu" not in df.columns:
+        df["odeme_durumu"] = "Ödendi"
+
+    gelir = float(df[df["islem_turu"] == "Gelir"]["tutar"].sum())
+    gider = float(df[df["islem_turu"] == "Gider"]["tutar"].sum())
+    ciro = float(gelir)
+    brut_kar = float(gelir - gider)
 
     if brut_kar > 0:
-        donemsel_vergi = brut_kar * DONEMSEL_VERGI_ORANI
-        vergi_sonrasi_kalan = brut_kar - donemsel_vergi
-        yillik_vergi = vergi_sonrasi_kalan * YILLIK_VERGI_ORANI
-        toplam_vergi = donemsel_vergi + yillik_vergi
-        net_kar = brut_kar - toplam_vergi
+        donemsel_vergi = float(brut_kar * DONEMSEL_VERGI_ORANI)
+        vergi_sonrasi_kalan = float(brut_kar - donemsel_vergi)
+        yillik_vergi = float(vergi_sonrasi_kalan * YILLIK_VERGI_ORANI)
+        toplam_vergi = float(donemsel_vergi + yillik_vergi)
+        net_kar = float(brut_kar - toplam_vergi)
     else:
         donemsel_vergi = 0.0
-        vergi_sonrasi_kalan = brut_kar
+        vergi_sonrasi_kalan = float(brut_kar)
         yillik_vergi = 0.0
         toplam_vergi = 0.0
-        net_kar = brut_kar
+        net_kar = float(brut_kar)
 
-    tahsil_edilen = df[
-        (df["islem_turu"] == "Gelir")
-        & (df["odeme_durumu"].fillna("Ödendi") == "Ödendi")
-    ]["tutar"].sum()
+    tahsil_edilen = float(
+        df[
+            (df["islem_turu"] == "Gelir")
+            & (df["odeme_durumu"].fillna("Ödendi") == "Ödendi")
+        ]["tutar"].sum()
+    )
 
-    bekleyen_tahsilat = df[
-        (df["islem_turu"] == "Gelir")
-        & (df["odeme_durumu"].fillna("Ödendi") != "Ödendi")
-    ]["tutar"].sum()
+    bekleyen_tahsilat = float(
+        df[
+            (df["islem_turu"] == "Gelir")
+            & (df["odeme_durumu"].fillna("Ödendi") != "Ödendi")
+        ]["tutar"].sum()
+    )
 
     return {
-        "gelir": float(gelir),
-        "gider": float(gider),
-        "ciro": float(ciro),
-        "brut_kar": float(brut_kar),
-        "donemsel_vergi": float(donemsel_vergi),
-        "vergi_sonrasi_kalan": float(vergi_sonrasi_kalan),
-        "yillik_vergi": float(yillik_vergi),
-        "toplam_vergi": float(toplam_vergi),
-        "net_kar": float(net_kar),
-        "tahsil_edilen": float(tahsil_edilen),
-        "bekleyen_tahsilat": float(bekleyen_tahsilat),
+        "gelir": gelir,
+        "gider": gider,
+        "ciro": ciro,
+        "brut_kar": brut_kar,
+        "donemsel_vergi": donemsel_vergi,
+        "vergi_sonrasi_kalan": vergi_sonrasi_kalan,
+        "yillik_vergi": yillik_vergi,
+        "toplam_vergi": toplam_vergi,
+        "net_kar": net_kar,
+        "tahsil_edilen": tahsil_edilen,
+        "bekleyen_tahsilat": bekleyen_tahsilat,
     }
-
-
 @st.cache_data(ttl=10)
 def get_dashboard_stats():
     df = get_all_transactions()
