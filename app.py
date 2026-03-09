@@ -105,12 +105,14 @@ def money(value):
     value = float(value or 0)
     return f"₺{value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-
 @st.cache_data(ttl=10)
 def read_df(query, params=None):
     conn = get_conn()
-    return pd.read_sql(query, conn, params=params)
-
+    with conn.cursor() as cur:
+        cur.execute(query, params or [])
+        rows = cur.fetchall()
+        columns = [desc[0] for desc in cur.description] if cur.description else []
+    return pd.DataFrame(rows, columns=columns)
 
 def execute_query(query, params=None):
     conn = get_conn()
@@ -203,13 +205,13 @@ def get_filter_options():
     cariler = read_df("SELECT DISTINCT cari_unvan FROM transactions WHERE cari_unvan IS NOT NULL AND cari_unvan <> '' ORDER BY cari_unvan")
     personeller = read_df("SELECT DISTINCT personel_adi FROM transactions WHERE personel_adi IS NOT NULL AND personel_adi <> '' ORDER BY personel_adi")
     odeme_durumlari = read_df("SELECT DISTINCT odeme_durumu FROM transactions WHERE odeme_durumu IS NOT NULL AND odeme_durumu <> '' ORDER BY odeme_durumu")
-    return {
-        "kategori": categories["kategori"].tolist() if not categories.empty else [],
-        "cari": cariler["cari_unvan"].tolist() if not cariler.empty else [],
-        "personel": personeller["personel_adi"].tolist() if not personeller.empty else [],
-        "odeme_durumu": odeme_durumlari["odeme_durumu"].tolist() if not odeme_durumlari.empty else [],
-    }
 
+    return {
+        "kategori": categories["kategori"].tolist() if ("kategori" in categories.columns and not categories.empty) else [],
+        "cari": cariler["cari_unvan"].tolist() if ("cari_unvan" in cariler.columns and not cariler.empty) else [],
+        "personel": personeller["personel_adi"].tolist() if ("personel_adi" in personeller.columns and not personeller.empty) else [],
+        "odeme_durumu": odeme_durumlari["odeme_durumu"].tolist() if ("odeme_durumu" in odeme_durumlari.columns and not odeme_durumlari.empty) else [],
+    }
 
 @st.cache_data(ttl=10)
 def get_transactions_advanced(
@@ -568,6 +570,8 @@ if menu == "Dashboard":
 # Yeni Kayıt
 # -------------------------------------------------
 elif menu == "Yeni Kayıt":
+    st.subheader("Yeni Gelir / Gider Kaydı")
+
     with st.form("kayit_formu", clear_on_submit=True):
         c1, c2, c3 = st.columns(3)
 
@@ -588,53 +592,66 @@ elif menu == "Yeni Kayıt":
         with c3:
             cari_unvan = st.text_input("Cari Ünvan")
             personel_adi = st.text_input("Personel Adı")
-            gider_merkezi = st.selectbox("Gider Merkezi", ["Servis", "Ofis", "Araç", "Depo", "Personel", "Satış", "Genel"])
+            gider_merkezi = st.selectbox(
+                "Gider Merkezi",
+                ["Servis", "Ofis", "Araç", "Depo", "Personel", "Satış", "Genel"],
+            )
             aciklama = st.text_input("Açıklama")
 
+        st.markdown("#### Vade / Tahsilat Bilgisi")
         v1, v2 = st.columns(2)
+
         with v1:
-            vade_tarihi = st.date_input("Vade Tarihi", value=None)
+            vade_var = st.checkbox("Vade Tarihi Gir")
+            vade_tarihi = st.date_input("Vade Tarihi", value=date.today()) if vade_var else None
+
         with v2:
-            tahsilat_tarihi = st.date_input("Tahsilat Tarihi", value=None)
+            tahsilat_var = st.checkbox("Tahsilat Tarihi Gir")
+            tahsilat_tarihi = st.date_input("Tahsilat Tarihi", value=date.today()) if tahsilat_var else None
 
         tahsilat_notu = st.text_input("Tahsilat Notu")
         notlar = st.text_area("Notlar")
+
         kaydet = st.form_submit_button("Kaydı Ekle", use_container_width=True)
 
         if kaydet:
-            if not aciklama.strip() or tutar <= 0:
-                st.error("Lütfen açıklama ve geçerli bir tutar girin.")
+            if not aciklama.strip():
+                st.error("Açıklama zorunludur.")
+            elif tutar <= 0:
+                st.error("Tutar 0'dan büyük olmalıdır.")
             else:
-                execute_query(
-                    """
-                    INSERT INTO transactions (
-                        tarih, islem_turu, kategori, alt_kategori, aciklama, tutar,
-                        odeme_turu, cari_unvan, personel_adi, odeme_durumu, gider_merkezi,
-                        vade_tarihi, tahsilat_tarihi, tahsilat_notu, notlar
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    [
-                        tarih,
-                        islem_turu,
-                        kategori,
-                        alt_kategori,
-                        aciklama,
-                        tutar,
-                        odeme_turu,
-                        cari_unvan,
-                        personel_adi,
-                        odeme_durumu,
-                        gider_merkezi,
-                        vade_tarihi,
-                        tahsilat_tarihi,
-                        tahsilat_notu,
-                        notlar,
-                    ],
-                )
-                clear_all_cache()
-                st.success("Kayıt eklendi.")
-                st.rerun()
-
+                try:
+                    execute_query(
+                        """
+                        INSERT INTO transactions (
+                            tarih, islem_turu, kategori, alt_kategori, aciklama, tutar,
+                            odeme_turu, cari_unvan, personel_adi, odeme_durumu, gider_merkezi,
+                            vade_tarihi, tahsilat_tarihi, tahsilat_notu, notlar
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        [
+                            tarih,
+                            islem_turu,
+                            kategori,
+                            alt_kategori or None,
+                            aciklama,
+                            float(tutar),
+                            odeme_turu,
+                            cari_unvan or None,
+                            personel_adi or None,
+                            odeme_durumu,
+                            gider_merkezi,
+                            vade_tarihi,
+                            tahsilat_tarihi,
+                            tahsilat_notu or None,
+                            notlar or None,
+                        ],
+                    )
+                    clear_all_cache()
+                    st.success("Kayıt başarıyla eklendi.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Kayıt eklenemedi: {e}")
 # -------------------------------------------------
 # Cari Hesaplar
 # -------------------------------------------------
