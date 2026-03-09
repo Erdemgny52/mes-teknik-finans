@@ -38,8 +38,8 @@ def get_conn():
         password=DB_PASSWORD,
         port=DB_PORT,
         autocommit=True,
+        prepare_threshold=None,
     )
-
 
 def init_db():
     conn = get_conn()
