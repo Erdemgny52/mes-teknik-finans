@@ -6,7 +6,7 @@ import streamlit as st
 
 # -------------------------------------------------
 # Mes Teknik Finans Takip Uygulaması
-# Web tabanlı - Supabase PostgreSQL bağlantılı
+# Hızlandırılmış web sürümü - Supabase PostgreSQL
 # -------------------------------------------------
 
 st.set_page_config(
@@ -15,7 +15,6 @@ st.set_page_config(
     layout="wide",
 )
 
-# Supabase bağlantı bilgileri (.streamlit/secrets.toml içinden okunur)
 DB_HOST = st.secrets["DB_HOST"]
 DB_NAME = st.secrets["DB_NAME"]
 DB_USER = st.secrets["DB_USER"]
@@ -24,11 +23,13 @@ DB_PORT = int(st.secrets["DB_PORT"])
 
 DONEMSEL_VERGI_ORANI = 0.20
 YILLIK_VERGI_ORANI = 0.25
+PAGE_SIZE = 100
 
 
 # -------------------------------------------------
 # Veritabanı bağlantısı
 # -------------------------------------------------
+@st.cache_resource
 def get_conn():
     return psycopg.connect(
         host=DB_HOST,
@@ -42,41 +43,54 @@ def get_conn():
 
 def init_db():
     conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS transactions (
-            id BIGSERIAL PRIMARY KEY,
-            tarih DATE NOT NULL,
-            islem_turu VARCHAR(20) NOT NULL,
-            kategori VARCHAR(100) NOT NULL,
-            alt_kategori VARCHAR(100),
-            aciklama TEXT NOT NULL,
-            tutar NUMERIC(12,2) NOT NULL,
-            odeme_turu VARCHAR(50),
-            cari_unvan VARCHAR(200),
-            personel_adi VARCHAR(200),
-            odeme_durumu VARCHAR(50) DEFAULT 'Ödendi',
-            gider_merkezi VARCHAR(100),
-            notlar TEXT,
-            created_at TIMESTAMP DEFAULT NOW()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS transactions (
+                id BIGSERIAL PRIMARY KEY,
+                tarih DATE NOT NULL,
+                islem_turu VARCHAR(20) NOT NULL,
+                kategori VARCHAR(100) NOT NULL,
+                alt_kategori VARCHAR(100),
+                aciklama TEXT NOT NULL,
+                tutar NUMERIC(12,2) NOT NULL,
+                odeme_turu VARCHAR(50),
+                cari_unvan VARCHAR(200),
+                personel_adi VARCHAR(200),
+                odeme_durumu VARCHAR(50) DEFAULT 'Ödendi',
+                gider_merkezi VARCHAR(100),
+                notlar TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+            """
         )
-    """)
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS cash_movements (
-            id BIGSERIAL PRIMARY KEY,
-            tarih DATE NOT NULL,
-            hesap_tipi VARCHAR(50) NOT NULL,
-            islem VARCHAR(50) NOT NULL,
-            tutar NUMERIC(12,2) NOT NULL,
-            aciklama TEXT,
-            created_at TIMESTAMP DEFAULT NOW()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cash_movements (
+                id BIGSERIAL PRIMARY KEY,
+                tarih DATE NOT NULL,
+                hesap_tipi VARCHAR(50) NOT NULL,
+                islem VARCHAR(50) NOT NULL,
+                tutar NUMERIC(12,2) NOT NULL,
+                aciklama TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+            """
         )
-    """)
 
-    cur.close()
-    conn.close()
+        cur.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()")
+        cur.execute("ALTER TABLE cash_movements ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()")
+
+        # Performans için indexler
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_transactions_tarih ON transactions (tarih)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_transactions_islem_turu ON transactions (islem_turu)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_transactions_cari_unvan ON transactions (cari_unvan)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_transactions_created_at ON transactions (created_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_cash_movements_tarih ON cash_movements (tarih)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_cash_movements_created_at ON cash_movements (created_at DESC)")
 
 
 # -------------------------------------------------
@@ -87,38 +101,90 @@ def money(value):
     return f"₺{value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+@st.cache_data(ttl=10)
 def read_df(query, params=None):
     conn = get_conn()
-    df = pd.read_sql(query, conn, params=params)
-    conn.close()
-    return df
+    return pd.read_sql(query, conn, params=params)
 
 
 def execute_query(query, params=None):
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(query, params or [])
-    cur.close()
-    conn.close()
+    with conn.cursor() as cur:
+        cur.execute(query, params or [])
 
 
-def filter_period(df, mode, selected_date):
-    if df.empty:
-        return df
+def clear_all_cache():
+    st.cache_data.clear()
 
-    df = df.copy()
-    df["tarih"] = pd.to_datetime(df["tarih"])
-    selected_date = pd.to_datetime(selected_date)
 
+@st.cache_data(ttl=10)
+def get_transactions_filtered(mode, selected_date):
     if mode == "Günlük":
-        return df[df["tarih"].dt.date == selected_date.date()]
+        query = """
+            SELECT *
+            FROM transactions
+            WHERE tarih = %s
+            ORDER BY tarih DESC, id DESC
+        """
+        return read_df(query, [selected_date])
+
     if mode == "Aylık":
-        return df[
-            (df["tarih"].dt.month == selected_date.month)
-            & (df["tarih"].dt.year == selected_date.year)
-        ]
-    if mode == "Yıllık":
-        return df[df["tarih"].dt.year == selected_date.year]
+        query = """
+            SELECT *
+            FROM transactions
+            WHERE EXTRACT(MONTH FROM tarih) = %s
+              AND EXTRACT(YEAR FROM tarih) = %s
+            ORDER BY tarih DESC, id DESC
+        """
+        return read_df(query, [selected_date.month, selected_date.year])
+
+    query = """
+        SELECT *
+        FROM transactions
+        WHERE EXTRACT(YEAR FROM tarih) = %s
+        ORDER BY tarih DESC, id DESC
+    """
+    return read_df(query, [selected_date.year])
+
+
+@st.cache_data(ttl=10)
+def get_cash_filtered(mode, selected_date):
+    if mode == "Günlük":
+        query = """
+            SELECT *
+            FROM cash_movements
+            WHERE tarih = %s
+            ORDER BY tarih DESC, id DESC
+        """
+        return read_df(query, [selected_date])
+
+    if mode == "Aylık":
+        query = """
+            SELECT *
+            FROM cash_movements
+            WHERE EXTRACT(MONTH FROM tarih) = %s
+              AND EXTRACT(YEAR FROM tarih) = %s
+            ORDER BY tarih DESC, id DESC
+        """
+        return read_df(query, [selected_date.month, selected_date.year])
+
+    query = """
+        SELECT *
+        FROM cash_movements
+        WHERE EXTRACT(YEAR FROM tarih) = %s
+        ORDER BY tarih DESC, id DESC
+    """
+    return read_df(query, [selected_date.year])
+
+
+@st.cache_data(ttl=10)
+def get_all_transactions():
+    return read_df("SELECT * FROM transactions ORDER BY tarih DESC, id DESC")
+
+
+@st.cache_data(ttl=10)
+def get_transaction_by_id(record_id):
+    df = read_df("SELECT * FROM transactions WHERE id = %s LIMIT 1", [int(record_id)])
     return df
 
 
@@ -181,13 +247,18 @@ def hesap_ozet(df):
     }
 
 
+def reset_edit_state():
+    if "edit_record_id" in st.session_state:
+        del st.session_state["edit_record_id"]
+
+
 # -------------------------------------------------
 # Başlangıç
 # -------------------------------------------------
 init_db()
 
 st.title("Mes Teknik Finans Takip")
-st.caption("Web tabanlı ortak kullanım sürümü - iPad, Android ve bilgisayar uyumlu")
+st.caption("Profesyonel, hızlı ve ortak kullanıma uygun sürüm")
 
 st.sidebar.header("Filtreler")
 rapor_tipi = st.sidebar.selectbox("Rapor Türü", ["Günlük", "Aylık", "Yıllık"])
@@ -204,12 +275,10 @@ menu = st.sidebar.radio(
     ],
 )
 
-transactions_df = read_df("SELECT * FROM transactions ORDER BY tarih DESC, id DESC")
-transactions_df = filter_period(transactions_df, rapor_tipi, secili_tarih)
+transactions_df = get_transactions_filtered(rapor_tipi, secili_tarih)
 summary = hesap_ozet(transactions_df)
 
-cash_df = read_df("SELECT * FROM cash_movements ORDER BY tarih DESC, id DESC")
-cash_df = filter_period(cash_df, rapor_tipi, secili_tarih)
+cash_df = get_cash_filtered(rapor_tipi, secili_tarih)
 
 # -------------------------------------------------
 # Dashboard
@@ -235,7 +304,7 @@ if menu == "Dashboard":
     if not transactions_df.empty:
         grafik_df = transactions_df.groupby(["tarih", "islem_turu"], as_index=False)["tutar"].sum()
         st.line_chart(grafik_df, x="tarih", y="tutar", color="islem_turu")
-        st.dataframe(transactions_df, use_container_width=True, hide_index=True)
+        st.dataframe(transactions_df.head(PAGE_SIZE), use_container_width=True, hide_index=True)
     else:
         st.info("Seçilen dönem için kayıt bulunamadı.")
 
@@ -267,7 +336,7 @@ elif menu == "Yeni Kayıt":
             aciklama = st.text_input("Açıklama")
 
         notlar = st.text_area("Notlar")
-        kaydet = st.form_submit_button("Kaydı Ekle")
+        kaydet = st.form_submit_button("Kaydı Ekle", use_container_width=True)
 
         if kaydet:
             if not aciklama.strip() or tutar <= 0:
@@ -295,6 +364,7 @@ elif menu == "Yeni Kayıt":
                         notlar,
                     ],
                 )
+                clear_all_cache()
                 st.success("Kayıt eklendi.")
                 st.rerun()
 
@@ -305,7 +375,7 @@ elif menu == "Cari Hesaplar":
     cari_df = transactions_df[transactions_df["cari_unvan"].fillna("") != ""] if not transactions_df.empty else pd.DataFrame()
 
     if not cari_df.empty:
-        st.dataframe(cari_df, use_container_width=True, hide_index=True)
+        st.dataframe(cari_df.head(PAGE_SIZE), use_container_width=True, hide_index=True)
 
         cari_ozet = (
             cari_df.groupby("cari_unvan")
@@ -348,7 +418,7 @@ elif menu == "Kasa / Banka":
         with c3:
             aciklama = st.text_input("Açıklama", key="cash_desc")
 
-        ekle = st.form_submit_button("Hareketi Kaydet")
+        ekle = st.form_submit_button("Hareketi Kaydet", use_container_width=True)
 
         if ekle:
             if tutar <= 0:
@@ -361,11 +431,12 @@ elif menu == "Kasa / Banka":
                     """,
                     [tarih, hesap_tipi, islem, tutar, aciklama],
                 )
+                clear_all_cache()
                 st.success("Kasa / banka hareketi kaydedildi.")
                 st.rerun()
 
     if not cash_df.empty:
-        st.dataframe(cash_df, use_container_width=True, hide_index=True)
+        st.dataframe(cash_df.head(PAGE_SIZE), use_container_width=True, hide_index=True)
 
         kasa_giris = cash_df[
             (cash_df["hesap_tipi"] == "Kasa") & (cash_df["islem"] == "Para Girişi")
@@ -395,7 +466,7 @@ elif menu == "Kasa / Banka":
 # Borç / Alacak Raporu
 # -------------------------------------------------
 elif menu == "Borç / Alacak Raporu":
-    tum_df = read_df("SELECT * FROM transactions ORDER BY tarih DESC, id DESC")
+    tum_df = get_all_transactions()
     cari_df = tum_df[tum_df["cari_unvan"].fillna("") != ""] if not tum_df.empty else pd.DataFrame()
 
     if not cari_df.empty:
@@ -427,19 +498,133 @@ elif menu == "Borç / Alacak Raporu":
 # -------------------------------------------------
 elif menu == "Tüm Hareketler":
     if not transactions_df.empty:
-        st.dataframe(transactions_df, use_container_width=True, hide_index=True)
+        st.subheader("Kayıt Listesi")
+        st.dataframe(transactions_df.head(PAGE_SIZE), use_container_width=True, hide_index=True)
 
-        secili_id = st.selectbox("Silinecek kayıt ID", transactions_df["id"].tolist())
+        secenek_df = transactions_df[["id", "tarih", "islem_turu", "kategori", "aciklama", "tutar"]].copy()
+        secenek_df["etiket"] = secenek_df.apply(
+            lambda r: f"#{int(r['id'])} | {str(r['tarih'])[:10]} | {r['islem_turu']} | {r['kategori']} | {r['aciklama']} | {money(r['tutar'])}",
+            axis=1,
+        )
+        secenekler = dict(zip(secenek_df["etiket"], secenek_df["id"]))
 
-        if st.button("Seçili Kaydı Sil"):
-            execute_query("DELETE FROM transactions WHERE id = %s", [int(secili_id)])
+        secili_etiket = st.selectbox("Düzenlenecek / silinecek kayıt", list(secenekler.keys()))
+        secili_id = int(secenekler[secili_etiket])
+
+        col_btn1, col_btn2 = st.columns(2)
+        if col_btn1.button("Kayıt Düzenle", use_container_width=True):
+            st.session_state["edit_record_id"] = secili_id
+        if col_btn2.button("Kayıt Sil", type="primary", use_container_width=True):
+            execute_query("DELETE FROM transactions WHERE id = %s", [secili_id])
+            clear_all_cache()
+            reset_edit_state()
             st.success("Kayıt silindi.")
             st.rerun()
+
+        if st.session_state.get("edit_record_id"):
+            edit_df = get_transaction_by_id(st.session_state["edit_record_id"])
+            if not edit_df.empty:
+                row = edit_df.iloc[0]
+                st.markdown("---")
+                st.subheader(f"Kayıt Düzenleme - #{int(row['id'])}")
+
+                with st.form("edit_form"):
+                    e1, e2, e3 = st.columns(3)
+
+                    with e1:
+                        edit_tarih = st.date_input("Tarih", value=pd.to_datetime(row["tarih"]).date(), key="edit_tarih")
+                        edit_islem_turu = st.selectbox("İşlem Türü", ["Gelir", "Gider"], index=0 if row["islem_turu"] == "Gelir" else 1)
+                        kategori_ops = ["Satış", "Servis", "Malzeme", "Personel", "Kira", "Elektrik", "Yakıt", "Vergi", "Diğer"]
+                        edit_kategori = st.selectbox(
+                            "Kategori",
+                            kategori_ops,
+                            index=kategori_ops.index(row["kategori"]) if row["kategori"] in kategori_ops else 0,
+                        )
+
+                    with e2:
+                        edit_alt_kategori = st.text_input("Alt Kategori", value=row["alt_kategori"] or "")
+                        odeme_ops = ["Nakit", "Banka", "Kredi Kartı", "Havale/EFT"]
+                        edit_odeme_turu = st.selectbox(
+                            "Ödeme Türü",
+                            odeme_ops,
+                            index=odeme_ops.index(row["odeme_turu"]) if row["odeme_turu"] in odeme_ops else 0,
+                        )
+                        odeme_durumu_ops = ["Ödendi", "Bekliyor", "Kısmi Ödeme"]
+                        edit_odeme_durumu = st.selectbox(
+                            "Ödeme Durumu",
+                            odeme_durumu_ops,
+                            index=odeme_durumu_ops.index(row["odeme_durumu"]) if row["odeme_durumu"] in odeme_durumu_ops else 0,
+                        )
+                        edit_tutar = st.number_input("Tutar (₺)", min_value=0.0, value=float(row["tutar"]), step=100.0)
+
+                    with e3:
+                        edit_cari_unvan = st.text_input("Cari Ünvan", value=row["cari_unvan"] or "")
+                        edit_personel_adi = st.text_input("Personel Adı", value=row["personel_adi"] or "")
+                        gider_ops = ["Servis", "Ofis", "Araç", "Depo", "Personel", "Satış", "Genel"]
+                        edit_gider_merkezi = st.selectbox(
+                            "Gider Merkezi",
+                            gider_ops,
+                            index=gider_ops.index(row["gider_merkezi"]) if row["gider_merkezi"] in gider_ops else len(gider_ops) - 1,
+                        )
+                        edit_aciklama = st.text_input("Açıklama", value=row["aciklama"] or "")
+
+                    edit_notlar = st.text_area("Notlar", value=row["notlar"] or "")
+
+                    eb1, eb2 = st.columns(2)
+                    guncelle = eb1.form_submit_button("Değişiklikleri Kaydet", use_container_width=True)
+                    iptal = eb2.form_submit_button("İptal", use_container_width=True)
+
+                    if guncelle:
+                        if not edit_aciklama.strip() or edit_tutar <= 0:
+                            st.error("Lütfen açıklama ve geçerli bir tutar girin.")
+                        else:
+                            execute_query(
+                                """
+                                UPDATE transactions
+                                SET tarih = %s,
+                                    islem_turu = %s,
+                                    kategori = %s,
+                                    alt_kategori = %s,
+                                    aciklama = %s,
+                                    tutar = %s,
+                                    odeme_turu = %s,
+                                    cari_unvan = %s,
+                                    personel_adi = %s,
+                                    odeme_durumu = %s,
+                                    gider_merkezi = %s,
+                                    notlar = %s,
+                                    updated_at = NOW()
+                                WHERE id = %s
+                                """,
+                                [
+                                    edit_tarih,
+                                    edit_islem_turu,
+                                    edit_kategori,
+                                    edit_alt_kategori,
+                                    edit_aciklama,
+                                    edit_tutar,
+                                    edit_odeme_turu,
+                                    edit_cari_unvan,
+                                    edit_personel_adi,
+                                    edit_odeme_durumu,
+                                    edit_gider_merkezi,
+                                    edit_notlar,
+                                    int(row["id"]),
+                                ],
+                            )
+                            clear_all_cache()
+                            reset_edit_state()
+                            st.success("Kayıt güncellendi.")
+                            st.rerun()
+
+                    if iptal:
+                        reset_edit_state()
+                        st.rerun()
     else:
         st.info("Seçilen dönemde kayıt yok.")
 
 st.markdown("---")
 st.caption(
-    "Vergi hesabı şu mantıkla yapılır: önce brüt kârdan %20 vergi düşülür, sonra kalan tutarın %25'i alınır. "
-    "Bu panel işletme içi takip içindir; resmî muhasebe için mali müşavir kontrolü gerekir."
+    "Bu sürümde hız için cache, SQL filtreleme ve index eklendi. "
+    "Kayıt düzenleme ve silme profesyonel akışla çalışır. Vergi hesabı: önce %20, sonra kalan tutarın %25'i."
 )
